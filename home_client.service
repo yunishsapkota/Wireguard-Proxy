@@ -1,0 +1,19 @@
+[Unit]
+Description=WireGuard CGNAT Hole-Punch Client
+After=network-online.target wireguard-wg0.service
+Wants=network-online.target
+# If your WireGuard interface has a different name, update the line above.
+# Remove the wireguard-wg0.service dependency if WireGuard is managed separately.
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/wg-relay
+ExecStart=/usr/bin/python3 /opt/wg-relay/home_client.py /opt/wg-relay/config.ini
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
