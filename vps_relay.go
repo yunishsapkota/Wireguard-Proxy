@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/binary"
 	"flag"
 	"fmt"
@@ -39,6 +41,7 @@ type Relay struct {
 	mu          sync.RWMutex
 	wgPort      int
 	bindAddr    string
+	authKey     []byte
 	homeEp      *net.UDPAddr
 	homeTs      time.Time
 	peersByID   map[uint32]*Peer
@@ -49,14 +52,59 @@ type Relay struct {
 	drops       uint64
 }
 
-func NewRelay(bindAddr string, wgPort int) *Relay {
+func NewRelay(bindAddr string, wgPort int, authKey string) *Relay {
 	return &Relay{
 		wgPort:      wgPort,
 		bindAddr:    bindAddr,
+		authKey:     []byte(authKey),
 		peersByID:   make(map[uint32]*Peer),
 		peersByAddr: make(map[string]*Peer),
 		nextPeerID:  1,
 	}
+}
+
+func signPacket(data []byte, key []byte) []byte {
+	ts := uint64(time.Now().UnixMilli())
+	var tsBytes [8]byte
+	binary.BigEndian.PutUint64(tsBytes[:], ts)
+
+	msg := make([]byte, len(data)+8)
+	copy(msg, data)
+	copy(msg[len(data):], tsBytes[:])
+
+	mac := hmac.New(sha256.New, key)
+	mac.Write(msg)
+	signature := mac.Sum(nil)
+
+	return append(msg, signature...)
+}
+
+func verifyPacket(data []byte, key []byte) ([]byte, bool) {
+	if len(data) < 40 { // at least 8 byte timestamp + 32 byte HMAC
+		return nil, false
+	}
+	macOffset := len(data) - 32
+	message := data[:macOffset]
+	signature := data[macOffset:]
+
+	mac := hmac.New(sha256.New, key)
+	mac.Write(message)
+	expectedMAC := mac.Sum(nil)
+
+	if !hmac.Equal(signature, expectedMAC) {
+		return nil, false
+	}
+
+	tsOffset := macOffset - 8
+	ts := binary.BigEndian.Uint64(message[tsOffset:macOffset])
+	now := uint64(time.Now().UnixMilli())
+
+	diff := int64(now) - int64(ts)
+	if diff < -5000 || diff > 10000 { // Allow 5 sec delay, 10 sec clock drift future
+		return nil, false
+	}
+
+	return message[:tsOffset], true
 }
 
 func (r *Relay) homeAlive() bool {
@@ -76,7 +124,6 @@ func (r *Relay) run() {
 	}
 	defer conn.Close()
 
-	// Maximize buffer sizes for high throughput (4MB)
 	conn.SetReadBuffer(4 * 1024 * 1024)
 	conn.SetWriteBuffer(4 * 1024 * 1024)
 
@@ -95,7 +142,6 @@ func (r *Relay) run() {
 			continue
 		}
 
-		// Discriminate packets based on Magic prefix
 		if bytes.Equal(buf[:4], Magic) {
 			r.handleControl(conn, buf[:n], raddr)
 		} else {
@@ -110,6 +156,26 @@ func (r *Relay) handleControl(conn *net.UDPConn, data []byte, addr *net.UDPAddr)
 	}
 	msgType := data[4]
 
+	var payload []byte
+	var ok bool
+	var wgBytes []byte
+
+	// If it's a DataReply, the header is exactly 49 bytes (MAGIC(4) + TYPE(1) + PEER(4) + TS(8) + HMAC(32))
+	if msgType == MsgDataReply {
+		if len(data) < 49 {
+			return
+		}
+		payload, ok = verifyPacket(data[:49], r.authKey)
+		wgBytes = data[49:]
+	} else {
+		payload, ok = verifyPacket(data, r.authKey)
+	}
+
+	if !ok {
+		log.Printf("Dropped invalid/spoofed control packet from %s", addr.String())
+		return
+	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -121,25 +187,28 @@ func (r *Relay) handleControl(conn *net.UDPConn, data []byte, addr *net.UDPAddr)
 		if changed {
 			log.Printf("Home registered: %s", addr.String())
 		}
-		conn.WriteToUDP(append(Magic, MsgAck), addr)
+		ack := append([]byte(nil), Magic...)
+		ack = append(ack, MsgAck)
+		conn.WriteToUDP(signPacket(ack, r.authKey), addr)
 
 	case MsgKeepalive:
 		if r.homeEp != nil && r.homeEp.String() == addr.String() {
 			r.homeTs = time.Now()
-			conn.WriteToUDP(append(Magic, MsgAck), addr)
+			ack := append([]byte(nil), Magic...)
+			ack = append(ack, MsgAck)
+			conn.WriteToUDP(signPacket(ack, r.authKey), addr)
 		} else {
 			log.Printf("Keepalive from unknown home: %s", addr.String())
 		}
 
 	case MsgDataReply:
-		if r.homeEp == nil || r.homeEp.String() != addr.String() || len(data) < 9 {
+		if r.homeEp == nil || r.homeEp.String() != addr.String() {
 			return
 		}
-		peerID := binary.BigEndian.Uint32(data[5:9])
+		peerID := binary.BigEndian.Uint32(payload[5:9])
 		peer, exists := r.peersByID[peerID]
 		if exists {
 			peer.LastSeen = time.Now()
-			wgBytes := data[9:]
 			_, err := conn.WriteToUDP(wgBytes, peer.Addr)
 			if err != nil {
 				r.drops++
@@ -166,12 +235,11 @@ func (r *Relay) handleWG(conn *net.UDPConn, data []byte, addr *net.UDPAddr) {
 		}
 		r.nextPeerID++
 
-		// Pre-pack the header: peer_id(4) + ip(4) + port(2) = 10 bytes
 		hdr := make([]byte, 10)
 		binary.BigEndian.PutUint32(hdr[0:4], peer.ID)
 		ipBytes := addr.IP.To4()
 		if ipBytes == nil {
-			ipBytes = net.ParseIP("0.0.0.0").To4() // Fallback
+			ipBytes = net.ParseIP("0.0.0.0").To4()
 		}
 		copy(hdr[4:8], ipBytes)
 		binary.BigEndian.PutUint16(hdr[8:10], uint16(addr.Port))
@@ -184,12 +252,19 @@ func (r *Relay) handleWG(conn *net.UDPConn, data []byte, addr *net.UDPAddr) {
 	peer.LastSeen = time.Now()
 	homeEp := r.homeEp
 
-	// Create forward packet: MAGIC(4) | MsgDataFwd(1) | HDR(10) | DATA
-	fwd := make([]byte, 15+len(data))
-	copy(fwd[0:4], Magic)
-	fwd[4] = MsgDataFwd
-	copy(fwd[5:15], peer.PackedHdr)
-	copy(fwd[15:], data)
+	// Create forward packet header: MAGIC(4) | MsgDataFwd(1) | HDR(10)
+	hdr := make([]byte, 15)
+	copy(hdr[0:4], Magic)
+	hdr[4] = MsgDataFwd
+	copy(hdr[5:15], peer.PackedHdr)
+	
+	// Sign only the header
+	signedHdr := signPacket(hdr, r.authKey)
+	
+	// Append WG data
+	fwd := make([]byte, len(signedHdr)+len(data))
+	copy(fwd, signedHdr)
+	copy(fwd[len(signedHdr):], data)
 	r.mu.Unlock()
 
 	_, err := conn.WriteToUDP(fwd, homeEp)
@@ -267,7 +342,7 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
 	config := parseINI(*cfgPath, "relay")
-	
+
 	bind := "0.0.0.0"
 	if b, ok := config["bind_addr"]; ok && b != "" {
 		bind = b
@@ -278,7 +353,11 @@ func main() {
 			port = p
 		}
 	}
+	authKey, ok := config["auth_key"]
+	if !ok || authKey == "" || authKey == "CHANGE_ME_TO_A_SECURE_RANDOM_STRING" {
+		log.Fatalf("Missing or default 'auth_key' in [relay] section of %s", *cfgPath)
+	}
 
-	relay := NewRelay(bind, port)
+	relay := NewRelay(bind, port, authKey)
 	relay.run()
 }

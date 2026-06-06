@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/binary"
 	"flag"
 	"log"
@@ -39,13 +41,14 @@ type Client struct {
 	mu         sync.RWMutex
 	vpsAddr    *net.UDPAddr
 	wgLocal    *net.UDPAddr
+	authKey    []byte
 	tunnelConn *net.UDPConn
 	registered bool
 	lastAck    time.Time
 	peers      map[uint32]*PseudoPeer
 }
 
-func NewClient(vpsStr string, wgLocalStr string) *Client {
+func NewClient(vpsStr string, wgLocalStr string, authKey string) *Client {
 	vpsAddr, err := net.ResolveUDPAddr("udp", vpsStr)
 	if err != nil {
 		log.Fatalf("Failed to resolve VPS address: %v", err)
@@ -58,19 +61,62 @@ func NewClient(vpsStr string, wgLocalStr string) *Client {
 	return &Client{
 		vpsAddr: vpsAddr,
 		wgLocal: wgAddr,
+		authKey: []byte(authKey),
 		peers:   make(map[uint32]*PseudoPeer),
 	}
 }
 
+func signPacket(data []byte, key []byte) []byte {
+	ts := uint64(time.Now().UnixMilli())
+	var tsBytes [8]byte
+	binary.BigEndian.PutUint64(tsBytes[:], ts)
+
+	msg := make([]byte, len(data)+8)
+	copy(msg, data)
+	copy(msg[len(data):], tsBytes[:])
+
+	mac := hmac.New(sha256.New, key)
+	mac.Write(msg)
+	signature := mac.Sum(nil)
+
+	return append(msg, signature...)
+}
+
+func verifyPacket(data []byte, key []byte) ([]byte, bool) {
+	if len(data) < 40 {
+		return nil, false
+	}
+	macOffset := len(data) - 32
+	message := data[:macOffset]
+	signature := data[macOffset:]
+
+	mac := hmac.New(sha256.New, key)
+	mac.Write(message)
+	expectedMAC := mac.Sum(nil)
+
+	if !hmac.Equal(signature, expectedMAC) {
+		return nil, false
+	}
+
+	tsOffset := macOffset - 8
+	ts := binary.BigEndian.Uint64(message[tsOffset:macOffset])
+	now := uint64(time.Now().UnixMilli())
+
+	diff := int64(now) - int64(ts)
+	if diff < -5000 || diff > 10000 {
+		return nil, false
+	}
+
+	return message[:tsOffset], true
+}
+
 func (c *Client) run(localPort int) {
-	// Bind tunnel socket
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("0.0.0.0"), Port: localPort})
 	if err != nil {
 		log.Fatalf("Failed to listen on tunnel port: %v", err)
 	}
 	c.tunnelConn = conn
-	
-	// Maximize buffer sizes (4MB)
+
 	c.tunnelConn.SetReadBuffer(4 * 1024 * 1024)
 	c.tunnelConn.SetWriteBuffer(4 * 1024 * 1024)
 
@@ -96,6 +142,25 @@ func (c *Client) run(localPort int) {
 				continue
 			}
 			msgType := buf[4]
+			
+			var payload []byte
+			var ok bool
+			var wgBytes []byte
+
+			if msgType == MsgDataFwd {
+				if n < 55 { // MAGIC(4) + TYPE(1) + PEER(10) + TS(8) + HMAC(32)
+					continue
+				}
+				payload, ok = verifyPacket(buf[:55], c.authKey)
+				wgBytes = buf[55:n]
+			} else {
+				payload, ok = verifyPacket(buf[:n], c.authKey)
+			}
+
+			if !ok {
+				continue
+			}
+
 			if msgType == MsgAck {
 				c.mu.Lock()
 				if !c.registered {
@@ -105,14 +170,10 @@ func (c *Client) run(localPort int) {
 				c.lastAck = time.Now()
 				c.mu.Unlock()
 			} else if msgType == MsgDataFwd {
-				if n < 15 {
-					continue
-				}
-				peerID := binary.BigEndian.Uint32(buf[5:9])
-				ip := net.IP(buf[9:13])
-				port := binary.BigEndian.Uint16(buf[13:15])
+				peerID := binary.BigEndian.Uint32(payload[5:9])
+				ip := net.IP(payload[9:13])
+				port := binary.BigEndian.Uint16(payload[13:15])
 				extAddr := (&net.UDPAddr{IP: ip, Port: int(port)}).String()
-				wgBytes := buf[15:n]
 
 				c.mu.Lock()
 				peer, exists := c.peers[peerID]
@@ -155,24 +216,25 @@ func (c *Client) pseudoPeerReadLoop(peer *PseudoPeer) {
 	for {
 		n, _, err := peer.Conn.ReadFromUDP(buf)
 		if err != nil {
-			return // Socket closed, goroutine exits
+			return
 		}
 
 		c.mu.Lock()
 		peer.LastSeen = time.Now()
 		c.mu.Unlock()
 
-		reply := make([]byte, 9+n)
-		copy(reply[0:9], hdr)
-		copy(reply[9:], buf[:n])
+		signedHdr := signPacket(hdr, c.authKey)
+		reply := make([]byte, len(signedHdr)+n)
+		copy(reply, signedHdr)
+		copy(reply[len(signedHdr):], buf[:n])
 
 		c.tunnelConn.WriteToUDP(reply, c.vpsAddr)
 	}
 }
 
 func (c *Client) keepaliveLoop() {
-	regPkt := append(Magic, MsgRegister)
-	keepPkt := append(Magic, MsgKeepalive)
+	regPkt := []byte{0xDE, 0xAD, 0xBE, 0xEF, MsgRegister}
+	keepPkt := []byte{0xDE, 0xAD, 0xBE, 0xEF, MsgKeepalive}
 
 	for {
 		c.mu.Lock()
@@ -181,10 +243,12 @@ func (c *Client) keepaliveLoop() {
 		c.mu.Unlock()
 
 		if !reg {
-			c.tunnelConn.WriteToUDP(regPkt, c.vpsAddr)
+			signedPkt := signPacket(regPkt, c.authKey)
+			c.tunnelConn.WriteToUDP(signedPkt, c.vpsAddr)
 			log.Printf("REGISTER -> %s", c.vpsAddr)
 		} else {
-			c.tunnelConn.WriteToUDP(keepPkt, c.vpsAddr)
+			signedPkt := signPacket(keepPkt, c.authKey)
+			c.tunnelConn.WriteToUDP(signedPkt, c.vpsAddr)
 			if ackElapsed > AckTimeout {
 				log.Printf("No ACK for %v — re-registering...", AckTimeout)
 				c.mu.Lock()
@@ -278,7 +342,12 @@ func main() {
 			localPort = p
 		}
 	}
+	
+	authKey, ok := config["auth_key"]
+	if !ok || authKey == "" || authKey == "CHANGE_ME_TO_A_SECURE_RANDOM_STRING" {
+		log.Fatalf("Missing or default 'auth_key' in [client] section of %s", *cfgPath)
+	}
 
-	client := NewClient(vpsEndpoint, wgLocal)
+	client := NewClient(vpsEndpoint, wgLocal, authKey)
 	client.run(localPort)
 }
